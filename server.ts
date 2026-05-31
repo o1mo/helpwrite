@@ -3,10 +3,21 @@ import Anthropic from '@anthropic-ai/sdk';
 
 const RECALL_API_TOKEN = Deno.env.get("RECALL_API_TOKEN");
 const RECALL_API_BASE = Deno.env.get("RECALL_API_BASE") ?? "https://us-west-2.recall.ai/api/v1";
+const RECALL_PUBLIC_URL = Deno.env.get("RECALL_PUBLIC_URL")?.replace(/\/$/, "");
 const ANTHROPIC_API_KEY = Deno.env.get("ANTHROPIC_API_KEY");
 const ANTHROPIC_MODEL = Deno.env.get("ANTHROPIC_MODEL") ?? "claude-sonnet-4-6";
 
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
+
+type TranscriptEntry = {
+  id: string;
+  speaker: string;
+  text: string;
+  timestamp: number;
+};
+
+const liveTranscripts = new Map<string, TranscriptEntry[]>();
+const sseSubscribers = new Map<string, Set<(entry: TranscriptEntry) => void>>();
 
 function addCorsHeaders(headers: Record<string, string> = {}) {
   return {
@@ -16,6 +27,15 @@ function addCorsHeaders(headers: Record<string, string> = {}) {
     "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Requested-With",
     ...headers
   };
+}
+
+function getRealtimeWebhookUrl(): string | null {
+  if (!RECALL_PUBLIC_URL) return null;
+  return `${RECALL_PUBLIC_URL}/api/recall/webhook`;
+}
+
+function isLiveTranscriptEnabled(): boolean {
+  return getRealtimeWebhookUrl() !== null;
 }
 
 async function recallFetch(path: string, init?: RequestInit) {
@@ -31,16 +51,32 @@ async function recallFetch(path: string, init?: RequestInit) {
 }
 
 function buildBotPayload(meetingUrl: string, botName = "HelpWrite") {
+  const recording_config: Record<string, unknown> = {
+    transcript: {
+      provider: {
+        recallai_streaming: {
+          mode: "prioritize_low_latency",
+          language_code: "en",
+        },
+      },
+    },
+  };
+
+  const webhookUrl = getRealtimeWebhookUrl();
+  if (webhookUrl) {
+    recording_config.realtime_endpoints = [
+      {
+        type: "webhook",
+        url: webhookUrl,
+        events: ["transcript.data"],
+      },
+    ];
+  }
+
   return {
     meeting_url: meetingUrl,
     bot_name: botName,
-    recording_config: {
-      transcript: {
-        provider: {
-          meeting_captions: {}
-        }
-      }
-    }
+    recording_config,
   };
 }
 
@@ -56,10 +92,10 @@ function getBotStatusMessage(bot: Record<string, unknown>): string | null {
   return statusChanges[statusChanges.length - 1].message ?? null;
 }
 
-function parseTranscriptDownload(data: unknown): Array<{ speaker: string; text: string; timestamp: number }> {
+function parseTranscriptDownload(data: unknown): TranscriptEntry[] {
   if (!Array.isArray(data)) return [];
 
-  return data.flatMap((entry: Record<string, unknown>) => {
+  return data.flatMap((entry: Record<string, unknown>, index: number) => {
     const participant = entry.participant as { name?: string } | undefined;
     const words = entry.words as Array<{ text?: string; start_timestamp?: number | { relative?: number } }> | undefined;
     if (!words?.length) return [];
@@ -71,10 +107,81 @@ function parseTranscriptDownload(data: unknown): Array<{ speaker: string; text: 
     const rawTimestamp = words[0].start_timestamp;
     const timestamp = typeof rawTimestamp === "number"
       ? rawTimestamp
-      : rawTimestamp?.relative ?? Date.now();
+      : rawTimestamp?.relative != null
+        ? Math.round(rawTimestamp.relative * 1000)
+        : Date.now();
 
-    return [{ speaker, text, timestamp }];
+    return [{
+      id: `download-${index}-${timestamp}`,
+      speaker,
+      text,
+      timestamp,
+    }];
   });
+}
+
+function parseRealtimeTranscriptEvent(body: Record<string, unknown>): { botId: string; entry: TranscriptEntry } | null {
+  if (body.event !== "transcript.data") return null;
+
+  const envelope = body.data as Record<string, unknown> | undefined;
+  const part = envelope?.data as Record<string, unknown> | undefined;
+  if (!part) return null;
+
+  const bot = envelope?.bot as { id?: string } | undefined;
+  const botId = bot?.id;
+  if (!botId) return null;
+
+  const participant = part.participant as { name?: string | null; id?: number | null } | undefined;
+  const words = part.words as Array<{
+    text?: string;
+    start_timestamp?: { relative?: number } | number;
+  }> | undefined;
+  if (!words?.length) return null;
+
+  const speaker = participant?.name
+    ?? (participant?.id != null ? `Participant ${participant.id}` : "Unknown");
+  const text = words.map((word) => word.text ?? "").join(" ").trim();
+  if (!text) return null;
+
+  const rawTimestamp = words[0].start_timestamp;
+  const timestamp = typeof rawTimestamp === "number"
+    ? rawTimestamp
+    : rawTimestamp?.relative != null
+      ? Math.round(rawTimestamp.relative * 1000)
+      : Date.now();
+
+  return {
+    botId,
+    entry: {
+      id: crypto.randomUUID(),
+      speaker,
+      text,
+      timestamp,
+    },
+  };
+}
+
+function appendLiveEntry(botId: string, entry: TranscriptEntry) {
+  const existing = liveTranscripts.get(botId) ?? [];
+  if (existing.some((e) => e.id === entry.id)) return;
+
+  const updated = [...existing, entry].sort((a, b) => a.timestamp - b.timestamp);
+  liveTranscripts.set(botId, updated);
+
+  for (const notify of sseSubscribers.get(botId) ?? []) {
+    notify(entry);
+  }
+}
+
+function mergeTranscriptEntries(live: TranscriptEntry[], downloaded: TranscriptEntry[]): TranscriptEntry[] {
+  const merged = [...live];
+  for (const entry of downloaded) {
+    const duplicate = merged.some(
+      (e) => e.speaker === entry.speaker && e.text === entry.text,
+    );
+    if (!duplicate) merged.push(entry);
+  }
+  return merged.sort((a, b) => a.timestamp - b.timestamp);
 }
 
 async function fetchBotTranscript(botId: string) {
@@ -82,7 +189,7 @@ async function fetchBotTranscript(botId: string) {
   const bot = await botResponse.json();
 
   if (!botResponse.ok) {
-    return { ok: false as const, status: botResponse.status, bot, entries: [] as ReturnType<typeof parseTranscriptDownload> };
+    return { ok: false as const, status: botResponse.status, bot, entries: [] as TranscriptEntry[] };
   }
 
   const recordings = bot.recordings as Array<{
@@ -102,7 +209,7 @@ async function fetchBotTranscript(botId: string) {
       ok: true as const,
       status: botResponse.status,
       bot,
-      entries: [] as ReturnType<typeof parseTranscriptDownload>,
+      entries: [] as TranscriptEntry[],
     };
   }
 
@@ -119,7 +226,7 @@ async function fetchBotTranscript(botId: string) {
 
 async function handler(req: Request): Promise<Response> {
   const url = new URL(req.url);
-  console.log(req);
+
   if (req.method === "OPTIONS") {
     return new Response(null, {
       status: 204,
@@ -129,6 +236,27 @@ async function handler(req: Request): Promise<Response> {
         "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Requested-With",
         "Access-Control-Max-Age": "86400"
       }
+    });
+  }
+
+  if (url.pathname === "/api/recall/webhook" && req.method === "POST") {
+    try {
+      const body = await req.json() as Record<string, unknown>;
+      const parsed = parseRealtimeTranscriptEvent(body);
+
+      if (parsed) {
+        appendLiveEntry(parsed.botId, parsed.entry);
+        console.log(`[live] ${parsed.entry.speaker}: ${parsed.entry.text}`);
+      } else if (body.event) {
+        console.log(`[webhook] unhandled event: ${body.event}`);
+      }
+    } catch (error) {
+      console.error("Webhook error:", error);
+    }
+
+    return new Response(JSON.stringify({ ok: true }), {
+      status: 200,
+      headers: addCorsHeaders(),
     });
   }
 
@@ -150,7 +278,16 @@ async function handler(req: Request): Promise<Response> {
     });
 
     const data = await response.json();
-    return new Response(JSON.stringify(data), {
+
+    if (response.ok && data.id) {
+      liveTranscripts.set(data.id, []);
+    }
+
+    return new Response(JSON.stringify({
+      ...data,
+      live_transcript_enabled: isLiveTranscriptEnabled(),
+      live_transcript_webhook: getRealtimeWebhookUrl(),
+    }), {
       status: response.status,
       headers: addCorsHeaders()
     });
@@ -169,18 +306,68 @@ async function handler(req: Request): Promise<Response> {
       meeting_url: bot.meeting_url,
       bot_name: bot.bot_name,
       recordings: bot.recordings ?? [],
-      raw: bot,
+      live_transcript_enabled: isLiveTranscriptEnabled(),
     }), {
       status: response.status,
       headers: addCorsHeaders()
     });
   }
 
+  if (url.pathname.match(/^\/api\/bot\/[^/]+\/transcript\/stream$/) && req.method === "GET") {
+    const botId = url.pathname.split("/")[3];
+    const encoder = new TextEncoder();
+
+    let cleanup: (() => void) | undefined;
+
+    const stream = new ReadableStream({
+      start(controller) {
+        const send = (event: string, data: unknown) => {
+          controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
+        };
+
+        for (const entry of liveTranscripts.get(botId) ?? []) {
+          send("entry", entry);
+        }
+
+        const listener = (entry: TranscriptEntry) => send("entry", entry);
+        const listeners = sseSubscribers.get(botId) ?? new Set();
+        listeners.add(listener);
+        sseSubscribers.set(botId, listeners);
+
+        const keepalive = setInterval(() => {
+          try {
+            controller.enqueue(encoder.encode(": keepalive\n\n"));
+          } catch {
+            clearInterval(keepalive);
+          }
+        }, 15000);
+
+        cleanup = () => {
+          clearInterval(keepalive);
+          listeners.delete(listener);
+          if (listeners.size === 0) sseSubscribers.delete(botId);
+        };
+      },
+      cancel() {
+        cleanup?.();
+      },
+    });
+
+    return new Response(stream, {
+      headers: {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "Access-Control-Allow-Origin": "*",
+      },
+    });
+  }
+
   if (url.pathname.startsWith("/api/bot/") && url.pathname.endsWith("/transcript") && req.method === "GET") {
     const botId = url.pathname.split("/")[3];
-    console.log("Fetching transcript for bot:", botId);
 
     try {
+      const live = liveTranscripts.get(botId) ?? [];
       const result = await fetchBotTranscript(botId);
 
       if (!result.ok && !result.bot?.id) {
@@ -190,11 +377,15 @@ async function handler(req: Request): Promise<Response> {
         });
       }
 
+      const entries = mergeTranscriptEntries(live, result.entries);
+
       return new Response(JSON.stringify({
         bot_id: botId,
         status: getBotStatus(result.bot),
         status_message: getBotStatusMessage(result.bot),
-        entries: result.entries,
+        entries,
+        live_count: live.length,
+        live_transcript_enabled: isLiveTranscriptEnabled(),
       }), {
         headers: addCorsHeaders()
       });
@@ -364,5 +555,9 @@ Provide 1-3 goals in the following JSON array format:
   });
 }
 
-console.log(`Server running on http://localhost:8000 (Anthropic model: ${ANTHROPIC_MODEL})`);
+const liveNote = isLiveTranscriptEnabled()
+  ? `live transcript webhook: ${getRealtimeWebhookUrl()}`
+  : "live transcript disabled — set RECALL_PUBLIC_URL to your ngrok/https tunnel (see README)";
+
+console.log(`Server running on http://localhost:8000 (${liveNote})`);
 Deno.serve({ port: 8000 }, handler);

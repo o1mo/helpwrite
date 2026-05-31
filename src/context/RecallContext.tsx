@@ -1,11 +1,15 @@
-import React, { createContext, useContext, useState, useEffect } from 'react'
+import React, { createContext, useContext, useState, useEffect, useRef } from 'react'
 import type { ProcessedTranscriptEntry } from '../types'
+
+const API_BASE = 'http://localhost:8000'
 
 interface RecallContextType {
   botId: string | null;
   botStatus: string | null;
   botStatusMessage: string | null;
   isConnected: boolean;
+  liveTranscriptEnabled: boolean;
+  liveTranscriptWarning: string | null;
   transcript: ProcessedTranscriptEntry[];
   error: string | null;
   isLoading: boolean;
@@ -29,14 +33,25 @@ function formatRecallError(data: Record<string, unknown>): string {
   return parts.join(' ') || 'Failed to create bot'
 }
 
+function appendEntry(
+  prev: ProcessedTranscriptEntry[],
+  entry: ProcessedTranscriptEntry,
+): ProcessedTranscriptEntry[] {
+  if (prev.some((e) => e.id === entry.id)) return prev
+  return [...prev, entry].sort((a, b) => a.timestamp - b.timestamp)
+}
+
 export function RecallProvider({ children }: { children: React.ReactNode }) {
   const [botId, setBotId] = useState<string | null>(null)
   const [botStatus, setBotStatus] = useState<string | null>(null)
   const [botStatusMessage, setBotStatusMessage] = useState<string | null>(null)
   const [isConnected, setIsConnected] = useState(false)
+  const [liveTranscriptEnabled, setLiveTranscriptEnabled] = useState(false)
+  const [liveTranscriptWarning, setLiveTranscriptWarning] = useState<string | null>(null)
   const [transcript, setTranscript] = useState<ProcessedTranscriptEntry[]>([])
   const [error, setError] = useState<string | null>(null)
   const [isLoading, setIsLoading] = useState(false)
+  const eventSourceRef = useRef<EventSource | null>(null)
 
   const createBot = async (meetingUrl: string) => {
     const trimmedUrl = meetingUrl.trim()
@@ -49,8 +64,9 @@ export function RecallProvider({ children }: { children: React.ReactNode }) {
       setIsLoading(true)
       setError(null)
       setTranscript([])
+      setLiveTranscriptWarning(null)
 
-      const response = await fetch('http://localhost:8000/api/bot', {
+      const response = await fetch(`${API_BASE}/api/bot`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ meeting_url: trimmedUrl })
@@ -62,7 +78,14 @@ export function RecallProvider({ children }: { children: React.ReactNode }) {
         throw new Error(formatRecallError(data))
       }
 
-      console.log('Bot created:', data.id)
+      const liveEnabled = data.live_transcript_enabled === true
+      setLiveTranscriptEnabled(liveEnabled)
+      if (!liveEnabled) {
+        setLiveTranscriptWarning(
+          'Live captions need RECALL_PUBLIC_URL in .env (your ngrok URL, no trailing slash). Transcript will only appear after the call ends until this is set.'
+        )
+      }
+
       setBotId(data.id)
       setBotStatus('ready')
       setBotStatusMessage(null)
@@ -70,49 +93,83 @@ export function RecallProvider({ children }: { children: React.ReactNode }) {
     } catch (err) {
       setBotId(null)
       setIsConnected(false)
+      setLiveTranscriptEnabled(false)
       setError(err instanceof Error ? err.message : 'Failed to create bot')
     } finally {
       setIsLoading(false)
     }
   }
 
+  // Real-time transcript via Server-Sent Events
   useEffect(() => {
     if (!botId) return
 
-    const intervalId = setInterval(async () => {
+    const es = new EventSource(`${API_BASE}/api/bot/${botId}/transcript/stream`)
+    eventSourceRef.current = es
+
+    const onEntry = (event: MessageEvent) => {
       try {
-        const response = await fetch(`http://localhost:8000/api/bot/${botId}/transcript`)
-        const data = await response.json()
+        const entry = JSON.parse(event.data) as ProcessedTranscriptEntry
+        setTranscript((prev) => appendEntry(prev, entry))
+      } catch (err) {
+        console.error('Failed to parse transcript SSE:', err)
+      }
+    }
 
-        if (!response.ok) {
-          console.error('Transcript poll error:', data)
-          return
+    es.addEventListener('entry', onEntry)
+    es.onerror = () => {
+      console.warn('Transcript stream disconnected, polling will backfill')
+    }
+
+    return () => {
+      es.removeEventListener('entry', onEntry)
+      es.close()
+      eventSourceRef.current = null
+    }
+  }, [botId])
+
+  // Bot status + fallback transcript poll (post-call download + reconnect)
+  useEffect(() => {
+    if (!botId) return
+
+    const poll = async () => {
+      try {
+        const [statusRes, transcriptRes] = await Promise.all([
+          fetch(`${API_BASE}/api/bot/${botId}`),
+          fetch(`${API_BASE}/api/bot/${botId}/transcript`),
+        ])
+
+        if (statusRes.ok) {
+          const statusData = await statusRes.json()
+          if (statusData.status) setBotStatus(statusData.status)
+          if (statusData.status_message !== undefined) {
+            setBotStatusMessage(statusData.status_message)
+          }
+          if (statusData.live_transcript_enabled !== undefined) {
+            setLiveTranscriptEnabled(statusData.live_transcript_enabled)
+          }
         }
 
-        if (data.status) {
-          setBotStatus(data.status)
-        }
-        if (data.status_message !== undefined) {
-          setBotStatusMessage(data.status_message)
-        }
+        if (!transcriptRes.ok) return
 
+        const data = await transcriptRes.json()
         const entries = Array.isArray(data.entries) ? data.entries : []
         if (entries.length === 0) return
 
-        setTranscript(prev => {
-          const uniqueMessages = entries.filter((newMsg: ProcessedTranscriptEntry) =>
-            !prev.some(existingMsg =>
-              existingMsg.text === newMsg.text &&
-              existingMsg.speaker === newMsg.speaker
-            )
-          )
-          return [...prev, ...uniqueMessages].sort((a, b) => a.timestamp - b.timestamp)
+        setTranscript((prev) => {
+          let next = prev
+          for (const entry of entries as ProcessedTranscriptEntry[]) {
+            next = appendEntry(next, entry)
+          }
+          return next
         })
       } catch (err) {
-        console.error('Transcript error:', err)
+        console.error('Transcript poll error:', err)
       }
-    }, 2000)
+    }
 
+    poll()
+    const intervalId = setInterval(poll, 3000)
     return () => clearInterval(intervalId)
   }, [botId])
 
@@ -122,6 +179,8 @@ export function RecallProvider({ children }: { children: React.ReactNode }) {
       botStatus,
       botStatusMessage,
       isConnected,
+      liveTranscriptEnabled,
+      liveTranscriptWarning,
       transcript,
       error,
       isLoading,

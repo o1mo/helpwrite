@@ -53,6 +53,7 @@ export interface Change {
 }
 
 export interface ProcessedTranscriptEntry {
+  id: string;
   text: string;
   timestamp: number;
   speaker: string;

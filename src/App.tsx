@@ -3,7 +3,6 @@ import "./App.css"
 import { mockArticles, mockGoals, mockEdits } from "./mockData"
 import type { Change, TranscriptEntry, Goal, Edit } from "./types"
 import { DiffView } from "./components/DiffView"
-import { useAIDiffs } from './hooks/useAIDiffs'
 import { TranscriptInput } from "./components/TranscriptInput"
 import { useRecall } from './context/RecallContext'
 import type { ProcessedTranscriptEntry } from "./types"
@@ -11,7 +10,15 @@ import { PromptModal } from "./components/PromptModal"
 import { generateHelpCenterPrompt, generateGoalsPrompt } from "./services/ai/prompts"
 
 function App() {
-  const { transcript, isConnected, botId, botStatus, botStatusMessage, error: recallError } = useRecall()
+  const {
+    transcript,
+    isConnected,
+    botId,
+    botStatus,
+    botStatusMessage,
+    liveTranscriptWarning,
+    error: recallError,
+  } = useRecall()
   
   const [currentChange, setCurrentChange] = useState<Change>({
     id: '123',
@@ -33,8 +40,6 @@ function App() {
   const [selectedGoalForDetail, setSelectedGoalForDetail] = useState<Goal | null>(null)
 
   const selectedEdit = mockEdits.find(e => e.articleId === selectedArticle)
-
-  const { generateEdits, isGenerating, error: aiError } = useAIDiffs()
 
   useEffect(() => {
     if (transcript.length > 0) {
@@ -201,52 +206,23 @@ function App() {
     }
   };
 
-  // Add this sample transcript for testing
-  const sampleTranscript = [
-    {
-      speaker: "John",
-      text: "We need to update our Australian payroll documentation. The tax rates changed last quarter and the setup guide is missing information about Single Touch Payroll reporting.",
-      timestamp: 1620000000000
-    },
-    {
-      speaker: "Sarah",
-      text: "You're right. We're getting a lot of support tickets about this. The STP section needs to be more detailed, especially for new businesses.",
-      timestamp: 1620000010000
-    },
-    {
-      speaker: "John",
-      text: "Also, the German employment law document doesn't mention the new remote work regulations that came into effect in January.",
-      timestamp: 1620000020000
-    },
-    {
-      speaker: "Sarah",
-      text: "Good point. We should add a section on remote work compliance requirements for all EU countries, not just Germany.",
-      timestamp: 1620000030000
-    },
-    {
-      speaker: "John",
-      text: "And one more thing - customers are asking for better security guidelines, especially around cross-border data transfers after the Privacy Shield framework changes.",
-      timestamp: 1620000040000
-    }
-  ];
-
-  // Modify the generateGoals function to use the sample transcript when there's no real transcript
   const generateGoals = async () => {
+    if (transcript.length === 0) {
+      setError('Connect to a call and wait for live transcript (or end the call) before generating goals.')
+      return
+    }
+
     setIsLoading(true);
     setError(null);
     
     try {
-      // Use sample transcript if the real transcript is empty
-      const transcriptToUse = transcript.length > 0 ? transcript : sampleTranscript;
-      
-      // Prepare the data to send
       const data = {
-        transcript: transcriptToUse,
+        transcript,
         articles: mockArticles
       };
       
       console.log('Sending data to generate goals:', {
-        transcriptLength: transcriptToUse.length,
+        transcriptLength: transcript.length,
         articlesLength: mockArticles.length
       });
       
@@ -367,14 +343,23 @@ function App() {
             <div className="panel-header">Live Call transcript</div>
             <TranscriptInput />
             <div className="transcript">
-              <div style={{ padding: '8px', borderBottom: '1px solid #eee' }}>
-                {isConnected
-                  ? `Bot ${botId} — ${botStatus ?? 'connecting'}${botStatusMessage ? `: ${botStatusMessage}` : ''}`
-                  : 'Not connected'}
-              </div>
+              {isConnected && (
+                <div className="transcript-status" style={{ padding: '8px', borderBottom: '1px solid #eee', fontSize: '0.85em', color: '#666' }}>
+                  {botStatus ?? 'connecting'}{botStatusMessage ? ` — ${botStatusMessage}` : ''}
+                  {transcript.length > 0 && ` · ${transcript.length} lines`}
+                </div>
+              )}
+              {liveTranscriptWarning && (
+                <div className="error-message" style={{ background: '#fff8e6', color: '#664d00' }}>
+                  {liveTranscriptWarning}
+                </div>
+              )}
               {recallError && <div className="error-message">{recallError}</div>}
-              {transcript.map((entry, i) => (
-                <div key={i} style={{ padding: '8px', borderBottom: '1px solid #eee' }}>
+              {!isConnected && transcript.length === 0 && (
+                <div style={{ padding: '12px', color: '#888' }}>Paste a Google Meet link and connect to see live captions.</div>
+              )}
+              {transcript.map((entry) => (
+                <div key={entry.id} className="transcript-entry">
                   <b>{entry.speaker}</b>: {entry.text}
                 </div>
               ))}
@@ -388,7 +373,7 @@ function App() {
                 <button 
                   className="generate-button"
                   onClick={generateGoals}
-                  disabled={isLoading}
+                  disabled={isLoading || transcript.length === 0}
                 >
                   {isLoading ? 'Generating...' : 'Generate Goals'}
                 </button>

@@ -1,19 +1,96 @@
-# Vite + Deno + React
+# HelpWrite
 
-## Running
+HelpWrite is a prototype that turns customer-support calls into help-center updates. You join a live meeting, capture what was said, turn that conversation into documentation goals, and draft article edits against a sample knowledge base.
 
-You need to have Deno v2.0.0 or later installed to run this repo.
+## What it does (product view)
 
-Start a dev server:
+1. **Join the call** — You paste a Google Meet link and send a Recall.ai meeting bot into the call. The bot listens like a silent participant.
+2. **Live transcript** — As people speak, finalized captions appear in the app (typically within a few seconds). That text is the source of truth for everything downstream.
+3. **Goals** — From the transcript, AI suggests 1–3 strategic documentation goals (short titles + descriptions), e.g. “Update payroll setup guide for Australia.”
+4. **Article changes** — Given those goals and mock help-center articles, AI proposes full revised article text. You review diffs in the UI.
 
+Today the knowledge base is **mock data** (not a real CMS). The Recall + Anthropic integrations are real.
+
+## Main pieces
+
+| Piece | Role |
+|-------|------|
+| **Web app** (`src/`) | React UI: connect to a meeting, show live transcript, goals grid, article list, diff viewer. |
+| **API server** (`server.ts`) | Deno backend on port 8000: creates Recall bots, receives live transcript webhooks, calls Claude for goals and edits. |
+| **Recall.ai** | Meeting bot + **Recall.ai Transcription** in low-latency mode (`prioritize_low_latency`, English). Sends `transcript.data` events to your server while the call is in progress. |
+| **Anthropic** | Generates goals and rewritten articles from transcript + mock articles. |
+
+## Running locally
+
+You need [Deno](https://deno.com/) 2.x.
+
+### 1. Environment
+
+Copy `.env.example` to `.env` and set:
+
+- `RECALL_API_TOKEN` — from the Recall dashboard  
+- `ANTHROPIC_API_KEY` — for goal/edit generation  
+- `RECALL_PUBLIC_URL` — **required for live transcript during the call** (see below)
+
+### 2. Expose the server for live transcript
+
+Recall delivers live captions to a **public HTTPS webhook**, not to `localhost`. In a second terminal:
+
+```bash
+ngrok http 8000
 ```
-$ deno task dev
+
+Put the ngrok HTTPS origin in `.env` (no path, no trailing slash), e.g.:
+
+```text
+RECALL_PUBLIC_URL=https://abc123.ngrok-free.app
 ```
 
-## Deploy
+Restart the API server after changing `.env`.
 
-Build production assets:
+### 3. Start everything
 
+Terminal A — API:
+
+```bash
+deno task server
 ```
-$ deno task build
+
+Terminal B — UI:
+
+```bash
+deno task dev
 ```
+
+Open the Vite URL (usually `http://localhost:5173`), paste your Meet link, connect, and speak. Lines should appear in **Live Call transcript** while you are still in the meeting.
+
+If `RECALL_PUBLIC_URL` is missing, the bot still joins and the **full transcript loads after you hang up** (post-meeting download), but nothing streams live.
+
+### 4. Build for production assets
+
+```bash
+deno task build
+```
+
+## How live transcript works
+
+```mermaid
+sequenceDiagram
+  participant UI as React app
+  participant API as Deno server
+  participant Recall as Recall.ai
+  participant Meet as Google Meet
+
+  UI->>API: Create bot (Meet URL)
+  API->>Recall: Bot + recallai_streaming + webhook URL
+  Recall->>Meet: Bot joins
+  loop While speaking
+    Recall->>API: POST transcript.data webhook
+    API->>UI: SSE stream entry
+  end
+  Note over API,Recall: After hang-up, transcript file also available via API poll
+```
+
+## License / notes
+
+This repo is a demo scaffold. Meeting bots must comply with your org’s recording and consent policies.
