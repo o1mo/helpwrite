@@ -2,7 +2,7 @@ import React, { useState } from 'react'
 import { useRecall } from '../context/RecallContext'
 
 export function TranscriptInput() {
-  const [meetingUrl, setMeetingUrl] = useState('https://meet.google.com/gob-ktyo-fqe')
+  const [meetingUrl, setMeetingUrl] = useState('')
   const { createBot, isConnected, error, isLoading } = useRecall()
 
   const handleSubmit = (e: React.FormEvent) => {
