@@ -1,13 +1,13 @@
 # HelpWrite
 
-HelpWrite is a prototype that turns customer-support calls into help-center updates. You join a live meeting, capture what was said, turn that conversation into documentation goals, and draft article edits against a sample knowledge base.
+HelpWrite turns team calls into documentation updates, while you're on the call. It joins your call, captures the conversation, identifies high level goals for your edits, then actually drafts edits to your knowledge base. 
 
 ## What it does (product view)
 
 1. **Join the call** — You paste a Google Meet link and send a Recall.ai meeting bot into the call. The bot listens like a silent participant.
-2. **Live transcript** — As people speak, finalized captions appear in the app (typically within a few seconds). That text is the source of truth for everything downstream.
-3. **Goals** — From the transcript, AI suggests 1–3 strategic documentation goals (short titles + descriptions), e.g. “Update payroll setup guide for Australia.”
-4. **Article changes** — Given those goals and mock help-center articles, AI proposes full revised article text. You review diffs in the UI.
+2. **Live transcript** — As people speak, the transcript appears in real-time. That text is the source of truth for everything downstream.
+3. **Goals** — To start the editing process, you first generate goals, using the transcript to identify the overarching themes for your planned edits. A call to Anthropic's API suggests 1–3 strategic documentation goals (short titles + descriptions), e.g. “Update payroll setup guide for Australia.”
+4. **Article changes** — Given those goals and the articles in your knowledgebase, you can then call the Antrhopic API for complete edits to relevant articles in the knowledge base. You review diffs in the UI.
 
 Today the knowledge base is **mock data** (not a real CMS). The Recall + Anthropic integrations are real.
 
@@ -65,12 +65,6 @@ deno task dev
 Open the Vite URL (usually `http://localhost:5173`), paste your Meet link, connect, and speak. Lines should appear in **Live Call transcript** while you are still in the meeting.
 
 If `RECALL_PUBLIC_URL` is missing, the bot still joins and the **full transcript loads after you hang up** (post-meeting download), but nothing streams live.
-
-### 4. Build for production assets
-
-```bash
-deno task build
-```
 
 ## How live transcript works
 
