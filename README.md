@@ -64,8 +64,6 @@ deno task dev
 
 Open the Vite URL (usually `http://localhost:5173`), paste your Meet link, connect, and speak. Lines should appear in **Live Call transcript** while you are still in the meeting.
 
-If `RECALL_PUBLIC_URL` is missing, the bot still joins and the **full transcript loads after you hang up** (post-meeting download), but nothing streams live.
-
 ## How live transcript works
 
 ```mermaid
